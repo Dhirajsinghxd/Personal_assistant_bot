@@ -11,7 +11,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI, NotFoundError
+from openai import OpenAI, NotFoundError, BadRequestError
 
 # Configure logging and hide sensitive URLs from httpx logs
 logging.basicConfig(
@@ -85,49 +85,61 @@ def start_health_server() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
+def call_model(model_id: str, messages: list[dict]) -> str:
+    """Calls a single model with enough token headroom for reasoning models."""
+    try:
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=0.85,
+            max_tokens=2048,
+            reasoning_effort="low",
+        )
+    except BadRequestError:
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=0.85,
+            max_tokens=2048,
+        )
+    return (response.choices[0].message.content or "").strip()
+
+
 def generate_ai_reply(messages: list[dict]) -> str:
-    """Calls Groq with automatic model fallback if a model ID is deprecated."""
+    """Calls Groq with automatic model fallback if a model ID is unavailable."""
     global ACTIVE_MODEL
 
     candidates = list(dict.fromkeys([ACTIVE_MODEL] + FALLBACK_MODELS))
-    last_not_found = None
+    last_error = None
 
     for model_id in candidates:
         try:
-            response = client.chat.completions.create(
-                model=model_id,
-                messages=messages,
-                temperature=0.85,
-                max_tokens=500,
-            )
-            content = (response.choices[0].message.content or "").strip()
+            content = call_model(model_id, messages)
             if content:
                 ACTIVE_MODEL = model_id
                 return content
-        except NotFoundError as e:
-            last_not_found = e
-            logger.warning(f"Model {model_id} unavailable, trying next model...")
+        except (NotFoundError, BadRequestError) as e:
+            last_error = e
+            logger.warning(f"Model {model_id} unavailable ({e}), trying next...")
             continue
 
     # Last-resort auto-discovery from available Groq chat models
     available = client.models.list()
-    excluded = ("whisper", "guard", "orpheus", "tts", "stt")
+    excluded = ("whisper", "guard", "safeguard", "orpheus", "tts", "stt", "llama-3.")
     for m in available.data:
         if not any(tag in m.id.lower() for tag in excluded):
-            response = client.chat.completions.create(
-                model=m.id,
-                messages=messages,
-                temperature=0.85,
-                max_tokens=500,
-            )
-            content = (response.choices[0].message.content or "").strip()
-            if content:
-                ACTIVE_MODEL = m.id
-                return content
+            try:
+                content = call_model(m.id, messages)
+                if content:
+                    ACTIVE_MODEL = m.id
+                    return content
+            except Exception as e:
+                last_error = e
+                continue
 
-    if last_not_found:
-        raise last_not_found
-    raise RuntimeError("No active chat model responded.")
+    if last_error:
+        raise last_error
+    raise RuntimeError("No active chat model returned text.")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

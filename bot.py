@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import (
@@ -11,11 +13,12 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# Configure logging
+# Configure logging and hide Telegram token URLs from httpx logs
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Retrieve configuration from environment variables (DO NOT paste keys here)
@@ -47,6 +50,31 @@ Personality & Tone:
 # In-memory conversation history per user
 MAX_HISTORY_LENGTH = 10
 user_conversations = defaultdict(list)
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Lightweight HTTP handler so Render's Free Web Service detects an open port."""
+
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Aarvi's Telegram bot is online!")
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+
+def start_health_server() -> None:
+    """Binds immediately to PORT so Render's Free Web Service stays live."""
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health-check server bound and listening on port {port}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -126,6 +154,9 @@ def main() -> None:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
     if not AI_API_KEY:
         raise ValueError("Missing AI_API_KEY / GROQ_API_KEY environment variable.")
+
+    # Bind port immediately so Render Free Web Service detects it
+    start_health_server()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 

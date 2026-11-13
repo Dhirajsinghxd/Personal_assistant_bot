@@ -11,9 +11,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI
+from openai import OpenAI, NotFoundError
 
-# Configure logging and hide Telegram token URLs from httpx logs
+# Configure logging and hide sensitive URLs from httpx logs
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -22,11 +22,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Retrieve configuration from environment variables (DO NOT paste keys here)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("GROQ_API_KEY")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
-AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/aarvi_pawarr")
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+AI_API_KEY = (os.getenv("AI_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").strip()
+PRIMARY_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-120b").strip()
+FALLBACK_MODELS = [
+    PRIMARY_MODEL,
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+]
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/aarvi_pawarr").strip()
+ACTIVE_MODEL = PRIMARY_MODEL
+LAST_AI_ERROR = "None"
 
 # Initialize AI client
 client = OpenAI(
@@ -77,6 +85,51 @@ def start_health_server() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
+def generate_ai_reply(messages: list[dict]) -> str:
+    """Calls Groq with automatic model fallback if a model ID is deprecated."""
+    global ACTIVE_MODEL
+
+    candidates = list(dict.fromkeys([ACTIVE_MODEL] + FALLBACK_MODELS))
+    last_not_found = None
+
+    for model_id in candidates:
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                temperature=0.85,
+                max_tokens=500,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            if content:
+                ACTIVE_MODEL = model_id
+                return content
+        except NotFoundError as e:
+            last_not_found = e
+            logger.warning(f"Model {model_id} unavailable, trying next model...")
+            continue
+
+    # Last-resort auto-discovery from available Groq chat models
+    available = client.models.list()
+    excluded = ("whisper", "guard", "orpheus", "tts", "stt")
+    for m in available.data:
+        if not any(tag in m.id.lower() for tag in excluded):
+            response = client.chat.completions.create(
+                model=m.id,
+                messages=messages,
+                temperature=0.85,
+                max_tokens=500,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            if content:
+                ACTIVE_MODEL = m.id
+                return content
+
+    if last_not_found:
+        raise last_not_found
+    raise RuntimeError("No active chat model responded.")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command."""
     user_first_name = update.effective_user.first_name or "there"
@@ -108,8 +161,20 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks AI key format and reports the active model and last error."""
+    key_prefix = f"{AI_API_KEY[:4]}... (len {len(AI_API_KEY)})" if len(AI_API_KEY) >= 4 else "Missing/Too Short"
+    await update.message.reply_text(
+        f"Bot Status:\n"
+        f"- Key format: {key_prefix}\n"
+        f"- Active model: {ACTIVE_MODEL}\n"
+        f"- Last AI error: {LAST_AI_ERROR}"
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes incoming messages and streams back AI-generated responses."""
+    """Processes incoming messages and returns AI-generated responses."""
+    global LAST_AI_ERROR
     if not update.message or not update.message.text:
         return
 
@@ -128,21 +193,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=0.85,
-            max_tokens=220,
-        )
-        reply_text = response.choices[0].message.content.strip()
+        reply_text = generate_ai_reply(messages)
 
         history.append({"role": "assistant", "content": reply_text})
         user_conversations[user_id] = history
+        LAST_AI_ERROR = "None (Working!)"
 
         await update.message.reply_text(reply_text)
 
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
+        LAST_AI_ERROR = f"{type(e).__name__}: {e}"
+        logger.error(f"Error handling message: {LAST_AI_ERROR}")
         await update.message.reply_text(
             "Oops, caught me mid-thought! Message me again in a second. 💕"
         )
@@ -163,12 +224,13 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("channel", channel_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
     logger.info("Aarvi's Telegram bot is now online and listening.")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

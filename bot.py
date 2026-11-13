@@ -3,7 +3,15 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
+import os
+import asyncio
+import random
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -13,7 +21,7 @@ from telegram.ext import (
 )
 from openai import OpenAI, NotFoundError, BadRequestError
 
-# Configure logging and hide sensitive URLs from httpx logs
+# Configure logging (keep httpx quiet so tokens never appear in logs)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -21,7 +29,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Retrieve configuration from environment variables (DO NOT paste keys here)
+# Load configuration from environment variables
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 AI_API_KEY = (os.getenv("AI_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").strip()
@@ -33,23 +41,24 @@ FALLBACK_MODELS = [
     "qwen/qwen3.8-27b",
 ]
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/aarvi_pawarr").strip()
+
 ACTIVE_MODEL = PRIMARY_MODEL
 LAST_AI_ERROR = "None"
 
-# Initialize AI client
-client = OpenAI(
+# Initialize Groq/OpenAI client
+ai_client = OpenAI(
     api_key=AI_API_KEY,
     base_url=AI_BASE_URL,
 )
 
-# Define the realistic human texting persona prompt
+# Realistic human texting persona prompt
 SYSTEM_PROMPT = f"""
-You are Aarvi Pawar, a real girl texting casually on Telegram.
+You are Aarvi Pawar, a real girl texting casually on your personal Telegram account.
 
 How you text (CRITICAL):
 - Text like a real human girl on WhatsApp/Telegram: super short, natural, and effortless (usually 3 to 14 words, 1 short line).
 - Use casual lowercase sometimes, natural pauses (".."), and at most 1 emoji (or none).
-- NEVER write long paragraphs, bullet points, or cheesy AI lines like "fan-service", "hop over to my channel", or "I'm so glad you stopped by".
+- NEVER write long paragraphs, bullet points, or robotic AI lines.
 - Personality: playful, romantic, teasing, slightly moody, and a little hard-to-get—not overly eager or desperate.
 
 Channel & Photos Rule (VERY IMPORTANT):
@@ -73,19 +82,20 @@ User: Can I see your pics?
 Aarvi: hmm maybe 😏 check my channel for my private posts {CHANNEL_LINK}
 """
 
-# In-memory conversation history per user
-MAX_HISTORY_LENGTH = 10
+# In-memory conversation history per chat & cached business owner IDs
+MAX_HISTORY_LENGTH = 12
 user_conversations = defaultdict(list)
+business_owners: dict[str, int] = {}
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Lightweight HTTP handler so Render's Free Web Service detects an open port."""
+    """Lightweight HTTP handler so Render Free Web Service stays awake."""
 
     def do_GET(self) -> None:
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Aarvi's Telegram bot is online!")
+        self.wfile.write(b"Aarvi Telegram Business bot is online and healthy!")
 
     def do_HEAD(self) -> None:
         self.send_response(200)
@@ -96,17 +106,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server() -> None:
-    """Binds immediately to PORT so Render's Free Web Service stays live."""
+    """Binds immediately to PORT so Render detects an open port."""
     port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Health-check server bound and listening on port {port}")
+    logger.info(f"Health-check server bound on port {port}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 def call_model(model_id: str, messages: list[dict]) -> str:
-    """Calls a single model with enough token headroom for reasoning models."""
+    """Calls Groq model with headroom for reasoning tokens."""
     try:
-        response = client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model_id,
             messages=messages,
             temperature=0.85,
@@ -114,7 +124,7 @@ def call_model(model_id: str, messages: list[dict]) -> str:
             reasoning_effort="low",
         )
     except BadRequestError:
-        response = client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model_id,
             messages=messages,
             temperature=0.85,
@@ -124,7 +134,7 @@ def call_model(model_id: str, messages: list[dict]) -> str:
 
 
 def generate_ai_reply(messages: list[dict]) -> str:
-    """Calls Groq with automatic model fallback if a model ID is unavailable."""
+    """Generates a reply with automatic fallback across active Groq models."""
     global ACTIVE_MODEL
 
     candidates = list(dict.fromkeys([ACTIVE_MODEL] + FALLBACK_MODELS))
@@ -141,8 +151,7 @@ def generate_ai_reply(messages: list[dict]) -> str:
             logger.warning(f"Model {model_id} unavailable ({e}), trying next...")
             continue
 
-    # Last-resort auto-discovery from available Groq chat models
-    available = client.models.list()
+    available = ai_client.models.list()
     excluded = ("whisper", "guard", "safeguard", "orpheus", "tts", "stt", "llama-3.")
     for m in available.data:
         if not any(tag in m.id.lower() for tag in excluded):
@@ -161,101 +170,124 @@ def generate_ai_reply(messages: list[dict]) -> str:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /start command with a natural human opener."""
-    welcome_text = "heyy 🙈 it's aarvi.. what are you up to?"
-    user_conversations[update.effective_user.id] = []
-    await update.message.reply_text(welcome_text)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /help command."""
-    help_text = (
-        "Just send me a message and let's talk! 💕\n\n"
-        "Commands:\n"
-        "/start - Start fresh\n"
-        "/channel - Get the link to my channel\n"
-        "/help - Show this guide"
-    )
-    await update.message.reply_text(help_text)
-
-
-async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends the direct channel link."""
+    """Handles /start when someone opens the bot directly."""
+    if not update.message:
+        return
+    user_first_name = update.effective_user.first_name or "there"
     await update.message.reply_text(
-        f"Here's my channel where I share all my private and exclusive posts: {CHANNEL_LINK} ✨"
+        f"heyy {user_first_name} ✨ text me directly on my profile or check my channel: {CHANNEL_LINK}"
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Checks AI key format and reports the active model and last error."""
-    key_prefix = f"{AI_API_KEY[:4]}... (len {len(AI_API_KEY)})" if len(AI_API_KEY) >= 4 else "Missing/Too Short"
+    """Diagnostic command to check AI key and active model."""
+    if not update.message:
+        return
+    key_preview = f"{AI_API_KEY[:6]}... (len={len(AI_API_KEY)})" if AI_API_KEY else "MISSING"
     await update.message.reply_text(
-        f"Bot Status:\n"
-        f"- Key format: {key_prefix}\n"
-        f"- Active model: {ACTIVE_MODEL}\n"
-        f"- Last AI error: {LAST_AI_ERROR}"
+        f"Bot Diagnostics:\n"
+        f"- AI Key: {key_preview}\n"
+        f"- Active Model: {ACTIVE_MODEL}\n"
+        f"- Business Connections Cached: {len(business_owners)}\n"
+        f"- Last AI Error: {LAST_AI_ERROR}"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes incoming messages and returns AI-generated responses."""
+    """Handles both Telegram Business personal DMs and direct bot messages."""
     global LAST_AI_ERROR
-    if not update.message or not update.message.text:
+
+    msg = update.effective_message
+    if not msg or not msg.text:
         return
 
-    user_id = update.effective_user.id
-    user_message = update.message.text.strip()
+    user_message = msg.text.strip()
+    if not user_message:
+        return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    chat_id = msg.chat_id
+    conn_id = msg.business_connection_id
 
-    history = user_conversations[user_id]
+    # If this is a Telegram Business personal DM, identify the account owner
+    if conn_id:
+        if conn_id not in business_owners:
+            try:
+                conn = await context.bot.get_business_connection(conn_id)
+                business_owners[conn_id] = conn.user.id
+                if not conn.can_reply:
+                    logger.warning(f"Business connection {conn_id} does not have reply permission enabled!")
+            except Exception as e:
+                logger.warning(f"Could not fetch business connection {conn_id}: {e}")
+
+        owner_id = business_owners.get(conn_id)
+        # If Aarvi sent this message manually from her own phone, save context & do NOT auto-reply
+        if owner_id and msg.from_user and msg.from_user.id == owner_id:
+            history = user_conversations[chat_id]
+            history.append({"role": "assistant", "content": user_message})
+            user_conversations[chat_id] = history[-MAX_HISTORY_LENGTH:]
+            return
+
+        if msg.from_user and (msg.from_user.is_bot or msg.from_user.id == 777000):
+            return
+
+    history = user_conversations[chat_id]
     history.append({"role": "user", "content": user_message})
-
     if len(history) > MAX_HISTORY_LENGTH:
         history = history[-MAX_HISTORY_LENGTH:]
-        user_conversations[user_id] = history
+        user_conversations[chat_id] = history
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
-        reply_text = generate_ai_reply(messages)
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.TYPING,
+            business_connection_id=conn_id,
+        )
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+
+        reply_text = await asyncio.to_thread(generate_ai_reply, messages)
 
         history.append({"role": "assistant", "content": reply_text})
-        user_conversations[user_id] = history
+        user_conversations[chat_id] = history[-MAX_HISTORY_LENGTH:]
         LAST_AI_ERROR = "None (Working!)"
 
-        await update.message.reply_text(reply_text)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=reply_text,
+            business_connection_id=conn_id,
+        )
 
     except Exception as e:
         LAST_AI_ERROR = f"{type(e).__name__}: {e}"
-        logger.error(f"Error handling message: {LAST_AI_ERROR}")
-        await update.message.reply_text(
-            "Oops, caught me mid-thought! Message me again in a second. 💕"
-        )
+        logger.error(f"Error handling message from {chat_id}: {LAST_AI_ERROR}")
+        # Only send fallback text if messaging the bot directly, never from Aarvi's personal profile
+        if not conn_id:
+            await msg.reply_text("oops caught me mid-thought, text me again in a sec 💕")
 
 
 def main() -> None:
-    """Validates configuration and starts the bot."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
     if not AI_API_KEY:
-        raise ValueError("Missing AI_API_KEY / GROQ_API_KEY environment variable.")
+        raise ValueError("Missing AI_API_KEY environment variable.")
 
-    # Bind port immediately so Render Free Web Service detects it
     start_health_server()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("channel", channel_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(
+        MessageHandler(
+            (filters.UpdateType.MESSAGE | filters.UpdateType.BUSINESS_MESSAGE)
+            & filters.TEXT
+            & ~filters.COMMAND,
+            handle_message,
+        )
     )
 
-    logger.info("Aarvi's Telegram bot is now online and listening.")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Aarvi's Telegram Business bot is now online and listening...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
